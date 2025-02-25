@@ -1,0 +1,30 @@
+data:
+  head_phi_range:
+  - -30
+  - 30
+  head_theta_range:
+  - 75
+  - 85
+  phi_range:
+  - -180
+  - 180
+  theta_range:
+  - 60
+  - 90
+model:
+  albedo_res: 2048
+  init_empty_tex: true
+  lock_geo: false
+  lock_tex: false
+  mesh: data/init_body/fit_smplx_dense.obj
+  skip_bg: true
+name: wo_normal_supervision
+stage: geo_tex
+test: false
+training:
+  anneal_tex_reso: true
+  ckpt: scratch
+  iters: 15000
+  train_face_ratio: 0.3
+  use_dpt: false
+  workspace: celebrities

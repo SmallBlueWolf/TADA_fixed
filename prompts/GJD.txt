@@ -1,0 +1,19 @@
+gardener
+warrior
+knight
+witch
+wizard
+Joker
+Clown
+Chef
+Nurse
+Dentist
+Doctor
+Artist
+Carpenter
+Farmer
+Athlete
+Pilot
+Firefighter
+Police officer
+astronaut
