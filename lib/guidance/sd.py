@@ -2,13 +2,14 @@ import cv2
 import numpy as np
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline
-
+import os
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import shutil
 
 from torch.cuda.amp import custom_bwd, custom_fwd
 from .perpneg_utils import weighted_perpendicular_aggregator
@@ -61,10 +62,21 @@ class StableDiffusion(nn.Module):
             raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
 
         # Create model
-        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        cache_dir = "./cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        local_model_dir = model_key.replace("/", os.path.sep)
+        if os.path.exists(local_model_dir):
+            shutil.rmtree(local_model_dir)
+
+        
+        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", cache_dir=cache_dir).to(self.device)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer", cache_dir=cache_dir)
+        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder", cache_dir=cache_dir).to(self.device)
+        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet", cache_dir=cache_dir).to(self.device)
+        self.unet.enable_gradient_checkpointing()
+        self.unet.enable_xformers_memory_efficient_attention()
+
 
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
@@ -93,7 +105,7 @@ class StableDiffusion(nn.Module):
 
         return text_embeddings
 
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, rgb_as_latents=False):
+    def train_step(self, text_embeddings, pred_rgb, guidance_scale=7.5, rgb_as_latents=False, q_unet = None, pose = None, shading = None):
         if rgb_as_latents:
             latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False)
             latents = latents * 2 - 1
@@ -104,6 +116,7 @@ class StableDiffusion(nn.Module):
         latents = torch.mean(latents, keepdim=True, dim=0)
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+        # 这里ProlificDreamer还给出一种模拟退火计算t的策略，因为默认也是不开启的，所以暂时不迁移
         t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), dtype=torch.long, device=self.device)
 
         # _t = time.time()
@@ -120,6 +133,32 @@ class StableDiffusion(nn.Module):
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+        '''
+            根据q_unet计算噪声，以及v_pred计算噪声
+            需要提供q_unet(lora)、pose、shading、
+        '''
+        
+        if True: # 如果不使用SDS策略
+            if q_unet is not None: # 另一个unet
+                if pose is not None:
+                    noise_pred_q = q_unet(latents_noisy, t, c = pose, shading = shading).sample
+                else:
+                    raise NotImplementedError()
+
+                if True: # SD中添加噪声的一种新型策略——让模型预测一个速度v，
+                    sqrt_alpha_prod = self.scheduler.alphas_cumprod.to(self.device)[t] ** 0.5
+                    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+                    while len(sqrt_alpha_prod.shape) < len(latents_noisy.shape):
+                        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+                    sqrt_one_minus_alpha_prod = (1 - self.scheduler.alphas_cumprod.to(self.device)[t]) ** 0.5
+                    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+                    while len(sqrt_one_minus_alpha_prod.shape) < len(latents_noisy.shape):
+                        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+                    noise_pred_q = sqrt_alpha_prod * noise_pred_q + sqrt_one_minus_alpha_prod * latents_noisy
+            else:
+                raise Exception("No valid q_unet")
+
+
         # w(t), sigma_t^2
         if self.weighting_strategy == "sds":
             # w(t), sigma_t^2
@@ -131,13 +170,17 @@ class StableDiffusion(nn.Module):
                 f"Unknown weighting strategy: {self.cfg.weighting_strategy}"
             )
 
-        grad = w * (noise_pred - noise)
+        # grad = w * (noise_pred - noise)
+        # 改变loss计算，减去q_unet预测的噪声
+        grad = w * (noise_pred - noise_pred_q)
         grad = torch.nan_to_num(grad)
 
         # d(loss)/d(latents) = latents - target = latents - (latents - grad) = grad
         loss = 0.5 * F.mse_loss(latents, (latents - grad).detach(), reduction="sum") / latents.shape[0]
+        
+        pseudo_loss = torch.mul((w*noise_pred).detach(), latents.detach()).detach().sum()
 
-        return loss
+        return loss, pseudo_loss, latents
 
     def train_step_perpneg(self, text_embeddings, weights, pred_rgb, guidance_scale=100, as_latent=False, grad_scale=1,
                            save_guidance_path=None):

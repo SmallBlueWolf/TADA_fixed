@@ -20,6 +20,8 @@ from lib.common.utils import *
 from lib.common.visual import draw_landmarks, draw_mediapipe_landmarks
 from lib.dpt import DepthNormalEstimation
 
+# 在train_one_step中调用
+
 class Trainer(object):
     def __init__(self,
                  name,  # name of this experiment
@@ -75,6 +77,16 @@ class Trainer(object):
         self.console = Console()
 
         self.model = model.to(self.device)
+        
+        '''自定义一些lora的超参在这里'''
+        self.unet_lr = 0.0001
+        self.unet_bs = 1
+        self.warm_iters = 500
+        self.K = 1
+        self.K2 = 1
+        
+        
+        
         # self.model = torch.nn.DataParallel(self.model, device_ids=[0, 1, 2, 3]).module
         if self.world_size > 1:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
@@ -103,6 +115,69 @@ class Trainer(object):
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4)  # naive adam
         else:
             self.optimizer = optimizer(self.model)
+
+        '''初始化定义q_uet，使用lora'''
+        if True: # 使用lora
+            from .lora_unet import UNet2DConditionModel
+            # from diffusers import UNet2DConditionModel
+            from diffusers.loaders import AttnProcsLayers
+            from diffusers.models.attention_processor import LoRAAttnProcessor
+            import einops
+            if True: # 使用v_pred
+                _unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="unet", low_cpu_mem_usage=False, device_map=None).to(device)
+                # 原版使用 stabilityai/stable-diffusion-2-1-base，也即不适用v_pred方法
+                _unet.requires_grad_(False)
+                lora_attn_procs = {}
+                for name in _unet.attn_processors.keys():
+                    cross_attention_dim = None if name.endswith("attn1.processor") else _unet.config.cross_attention_dim
+                    if name.startswith("mid_block"):
+                        hidden_size = _unet.config.block_out_channels[-1]
+                    elif name.startswith("up_blocks"):
+                        block_id = int(name[len("up_blocks.")])
+                        hidden_size = list(reversed(_unet.config.block_out_channels))[block_id]
+                    elif name.startswith("down_blocks"):
+                        block_id = int(name[len("down_blocks.")])
+                        hidden_size = _unet.config.block_out_channels[block_id]
+                    lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+                _unet.set_attn_processor(lora_attn_procs)
+                lora_layers = AttnProcsLayers(_unet.attn_processors)
+            '''这里额外设置了_uet各个层注意力机制的模块'''
+            '''这部分直接复制过来'''
+            text_input = self.guidance.tokenizer(self.text, padding='max_length', max_length=self.guidance.tokenizer.model_max_length, truncation=True, return_tensors='pt')
+            with torch.no_grad():
+                text_embeddings = self.guidance.text_encoder(text_input.input_ids.to(self.guidance.device))[0]
+            class LoraUnet(torch.nn.Module):
+                def __init__(self, device):
+                    super().__init__()
+                    self.unet = _unet
+                    self.sample_size = 64
+                    self.in_channels = 4
+                    self.device = device
+                    self.dtype = torch.float32
+                    self.text_embeddings = text_embeddings
+                def forward(self,x,t,c=None,shading="albedo"):
+                    textemb = einops.repeat(self.text_embeddings, '1 L D -> B L D', B=x.shape[0]).to(device)
+                    return self.unet(x,t,encoder_hidden_states=textemb,c=c,shading=shading)
+            self._unet = _unet
+            self.lora_layers = lora_layers
+            self.unet = LoraUnet(device=self.device).to(device)                     
+
+        self.unet = self.unet.to(self.device)
+        self.q_unet = self.unet
+        if True: # use lora
+            params = [
+                {'params': self.lora_layers.parameters()},
+                {'params': self._unet.camera_emb.parameters()},
+                {'params': self._unet.lambertian_emb},
+                {'params': self._unet.textureless_emb},
+                {'params': self._unet.normal_emb},
+            ] 
+        self.unet_optimizer = optim.AdamW(params, lr=self.unet_lr) # naive adam
+        warm_up_lr_unet = lambda iter: iter / (self.warm_iters*self.K+1) if iter <= (self.warm_iters*self.K+1) else 1
+        self.unet_scheduler = optim.lr_scheduler.LambdaLR(self.unet_optimizer, warm_up_lr_unet)
+        '''这部分直接复制过来'''
+
+        print("[bwINFO] Finish Init q_unet(lora)")
 
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1)  # fake scheduler
@@ -167,6 +242,28 @@ class Trainer(object):
                 self.log(f"[INFO] Loading {self.use_checkpoint} ...")
                 self.load_checkpoint(self.use_checkpoint)
 
+        # 初始化buffer
+        self.buffer_imgs = None
+        self.buffer_poses = None
+        
+        print("[bwINFO] Finish Trainer Init!")
+        
+    def add_buffer(self, latents, pose):
+        """将 latents 和 pose 添加到缓冲区"""
+        if not hasattr(self, 'buffer_imgs') or self.buffer_imgs is None:
+            self.buffer_imgs = latents.detach()
+            self.buffer_poses = pose.detach()
+        else:
+            self.buffer_imgs = torch.cat([self.buffer_imgs, latents.detach()], dim=0)[-self.opt.buffer_size:]
+            self.buffer_poses = torch.cat([self.buffer_poses, pose.detach()], dim=0)[-self.opt.buffer_size:]
+
+    def sample_buffer(self, batch_size):
+        """从缓冲区采样 batch_size 个 latents 和 pose"""
+        if self.buffer_imgs.shape[0] < batch_size:
+            idx = torch.arange(self.buffer_imgs.shape[0], device=self.device)
+        else:
+            idx = torch.randperm(self.buffer_imgs.shape[0], device=self.device)[:batch_size]
+        return self.buffer_imgs[idx], self.buffer_poses[idx]    
     # calculate the text embeddings.
     def prepare_text_embeddings(self):
         if self.text is None:
@@ -204,7 +301,21 @@ class Trainer(object):
                 print(*args, file=self.log_ptr)
                 self.log_ptr.flush()  # write immediately to file
 
-    def train_step(self, data, is_full_body):
+    def train_step(self, data, is_full_body=True):
+        """
+        根据输入数据执行训练步骤，计算损失并返回必要的信息
+        
+        Args:
+            data: 包含训练数据的字典
+            is_full_body: 布尔值，指示是否使用全身数据
+        
+        Returns:
+            pred: 渲染的RGB图像
+            loss: 计算的损失值
+            pseudo_loss: 伪损失值，用于监控
+            latents: 生成的潜在表示
+            shading: 使用的着色模式
+        """
         do_rgbd_loss = self.default_view_data is not None and (self.global_step % self.opt.known_view_interval == 0)
 
         if do_rgbd_loss:
@@ -214,8 +325,9 @@ class Trainer(object):
         mvp = data['mvp']  # [B, 4, 4]
         rays_o = data['rays_o']  # [B, N, 3]
         rays_d = data['rays_d']  # [B, N, 3]
+        B, N = rays_o.shape[:2]
 
-        # TEST: progressive training resolution
+        # 根据训练进度进行分辨率渐进式提升
         if self.opt.anneal_tex_reso:
             scale = min(1, self.global_step / (0.8 * self.opt.iters))
 
@@ -224,141 +336,155 @@ class Trainer(object):
             H = max(make_divisible(int(H * scale), 16), 32)
             W = max(make_divisible(int(W * scale), 16), 32)
 
+        # 对已知视图添加噪声以增强泛化能力
         if do_rgbd_loss and self.opt.known_view_noise_scale > 0:
-            noise_scale = self.opt.known_view_noise_scale  # * (1 - self.global_step / self.opt.iters)
+            noise_scale = self.opt.known_view_noise_scale
             rays_o = rays_o + torch.randn(3, device=self.device) * noise_scale
             rays_d = rays_d + torch.randn(3, device=self.device) * noise_scale
 
-        # ==============================================================================================
-        #  Compute loss
-        # ==============================================================================================
-
+        # 准备文本嵌入
         dir_text_z = [self.text_embeds['uncond'], self.text_embeds[data['camera_type'][0]][data['dirkey'][0]]]
         dir_text_z = torch.cat(dir_text_z)
 
+        # 执行第一次渲染，获取原始分辨率的输出
         out = self.model(rays_o, rays_d, mvp, data['H'], data['W'], shading='albedo')
         image = out['image'].permute(0, 3, 1, 2)
         normal = out['normal'].permute(0, 3, 1, 2)
         alpha = out['alpha'].permute(0, 3, 1, 2)
 
+        # 执行第二次渲染，获取可能缩放后的输出
         out_annel = self.model(rays_o, rays_d, mvp, H, W, shading='albedo')
         image_annel = out_annel['image'].permute(0, 3, 1, 2)
         normal_annel = out_annel['normal'].permute(0, 3, 1, 2)
         alpha_annel = out_annel['alpha'].permute(0, 3, 1, 2)
 
+        # 将图像和法线合并用于可视化
         pred = torch.cat([out['image'], out['normal']], dim=2)
         pred = (pred[0].detach().cpu().numpy() * 255).astype(np.uint8)
 
+        # 计算当前训练进度
         p_iter = self.global_step / self.opt.iters
 
-        if do_rgbd_loss:  # with image input
-            # gt_mask = data['mask']  # [B, H, W]
+        # 选择着色模式
+        # 随机决定使用哪种着色模式 - 主要是为了训练多个着色样式的能力
+        if self.global_step < self.opt.albedo_iters+1:
+            shading = 'albedo'
+        else: 
+            rand = random.random()
+            if rand > 0.8: 
+                shading = 'albedo'
+            elif rand > 0.4 and (not self.opt.no_textureless): 
+                shading = 'textureless'
+            else: 
+                if not self.opt.no_lambertian:
+                    shading = 'lambertian'
+                else:
+                    shading = 'albedo'
+                    
+        if self.opt.normal:
+            shading = 'normal'
+            if self.opt.p_textureless > random.random():
+                shading = 'textureless'
+                    
+        if self.global_step < self.opt.normal_iters+1:
+            as_latent = True
+            shading = 'normal'
+        else:
+            as_latent = False
+
+        # 使用RGB损失或SDS损失
+        if do_rgbd_loss:  # 使用RGB损失（当有真实图像参考时）
             gt_rgb = data['rgb']  # [B, 3, H, W]
             gt_normal = data['normal']  # [B, H, W, 3]
             gt_depth = data['depth']  # [B, H, W]
-            # rgb loss
+            
+            # RGB损失
             loss = self.opt.lambda_rgb * F.mse_loss(image, gt_rgb)
-            # normal loss
+            
+            # 法线损失
             if self.opt.lambda_normal > 0:
                 lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
                 loss = loss + lambda_normal * (1 - F.cosine_similarity(normal, gt_normal).mean())
-            # depth loss
+                
+            # 深度损失
             if self.opt.lambda_depth > 0:
                 lambda_depth = self.opt.lambda_depth * min(1, self.global_step / self.opt.iters)
                 loss = loss + lambda_depth * (1 - self.pearson(depth, gt_depth))
         else:
-            # rgb sds
-            loss = self.guidance.train_step(dir_text_z, image_annel).mean()
-            if not self.dpt:
-                # normal sds
-                loss += self.guidance.train_step(dir_text_z, normal).mean()
-                # latent mean sds
-                # loss += self.guidance.train_step(dir_text_z, torch.cat([normal, image.detach()])).mean() * 0.1
-            else:
-                if p_iter < 0.3 or random.random() < 0.5:
-                    # normal sds
-                    loss += self.guidance.train_step(dir_text_z, normal).mean()
-                elif self.dpt is not None :
-                    # normal image loss
-                    dpt_normal = self.dpt(image)
-                    dpt_normal = (1 - dpt_normal) * alpha + (1 - alpha)
-                    lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
-                    loss += lambda_normal * (1 - F.cosine_similarity(normal, dpt_normal).mean())
+            # 使用VDS/SDS损失 (根据是否提供q_unet决定)
+            # 将生成的图像送入guidance网络计算损失
+            
+            # VDS方法: 使用self.q_unet进行变分扩散得分估计
+            # 在 trainer.py 的 train_step 或类似方法中
+            pose = data['poses'].view(B, 16)
+            
+            loss, pseudo_loss, latents = self.guidance.train_step(
+                text_embeddings=dir_text_z,  # 文本嵌入，通常由 guidance.get_text_embeds 生成
+                pred_rgb=image_annel,  # 渲染图像或潜在表示
+                guidance_scale=100,  # 引导尺度
+                q_unet=self.q_unet,  # 分数估计网络
+                pose=pose,  # 可选的姿势条件
+                shading=shading if 'shading' in data else 'albedo'  # 可选的着色条件
+            )
+            print(f'[INFO] Finish calculating loss!')
+            
+            # # 额外的法线引导损失
+            # if not self.dpt:  # 如果没有深度预测网络
+            #     # 添加法线的guidance损失
+            #     normal_loss, _, _ = self.guidance.train_step(
+            #         dir_text_z, 
+            #         normal, 
+            #         guidance_scale=self.opt.scale, 
+            #         q_unet=self.q_unet,
+            #         pose=data['pose'].view(data['pose'].shape[0], 16) if 'pose' in data else None,
+            #         shading=shading
+            #     )
+            #     loss += normal_loss.mean()
+            # else:  # 如果有深度预测网络
+            #     # 在训练早期或随机情况下使用法线引导
+            #     if p_iter < 0.3 or random.random() < 0.5:
+            #         normal_loss, _, _ = self.guidance.train_step(
+            #             dir_text_z, 
+            #             normal, 
+            #             guidance_scale=self.opt.scale, 
+            #             q_unet=self.q_unet,
+            #             pose=data['pose'].view(data['pose'].shape[0], 16) if 'pose' in data else None,
+            #             shading=shading
+            #         )
+            #         loss += normal_loss.mean()
+            #     elif self.dpt is not None:
+            #         # 使用深度估计网络生成法线并计算损失
+            #         dpt_normal = self.dpt(image)
+            #         dpt_normal = (1 - dpt_normal) * alpha + (1 - alpha)
+            #         lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
+            #         loss += lambda_normal * (1 - F.cosine_similarity(normal, dpt_normal).mean())
 
-                    # pred = np.hstack([(normal[0]).permute(1, 2, 0).detach().cpu().numpy(),
-                    #                   dpt_normal[0].permute(1, 2, 0).detach().cpu().numpy()]) * 255
-                    # cv2.imwrite("im.png", pred)
-                    # exit()
+        # # 添加额外的正则化项
+        # if not self.opt.dmtet:
+        #     # 不透明度正则化
+        #     if self.opt.lambda_opacity > 0:
+        #         loss_opacity = (out['weights_sum'] ** 2).mean()
+        #         loss = loss + self.opt.lambda_opacity * loss_opacity
 
-        if False:
-            rgb_np_ori = out['image'].squeeze(0).detach().cpu().numpy()
-            mediapipe_landmarks = self.model.get_mediapipe_landmarks(rgb_np_ori * 255)
-            if len(mediapipe_landmarks) > 0:
-                mp_mouth_idx = [0, 321, 291, 37, 39, 40, 267, 17, 146, 84, 181, 405,
-                                375, 185, 314, 91, 61, 269, 270, 409, 291]
-                mp_nose_idx = [168, 6, 197, 195, 5]
-                mp_contour_idx = [132, 136, 397, 400, 148, 149, 150, 152, 288, 172, 176, 58,
-                                  323, 454, 93, 356, 361, 234, 365, 377, 378, 379, 127]
+        #     # 熵正则化
+        #     if self.opt.lambda_entropy > 0:
+        #         alphas = out['weights'].clamp(1e-5, 1 - 1e-5)
+        #         loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
+        #         loss = loss + self.opt.lambda_entropy * loss_entropy
 
-                mp_lmk_mouth = np.array([
-                    [landmark.x, landmark.y] for idx, landmark in enumerate(mediapipe_landmarks[0]) if
-                    idx in mp_mouth_idx
-                ])
-                mp_lmk_nose = np.array([
-                    [landmark.x, landmark.y] for idx, landmark in enumerate(mediapipe_landmarks[0]) if
-                    idx in mp_nose_idx
-                ])
-                mp_lmk_contour = np.array([
-                    [landmark.x, landmark.y] for idx, landmark in enumerate(mediapipe_landmarks[0]) if
-                    idx in mp_contour_idx
-                ])
-                mp_lmk_all = np.array(
-                    [[landmark.x, landmark.y] for idx, landmark in enumerate(mediapipe_landmarks[0])])
+        #     # 方向正则化
+        #     if self.opt.lambda_orient > 0 and 'loss_orient' in out:
+        #         loss_orient = out['loss_orient']
+        #         loss = loss + self.opt.lambda_orient * loss_orient
+        # else:
+        #     # DMTet特有的正则化
+        #     if self.opt.lambda_normal > 0:
+        #         loss = loss + self.opt.lambda_normal * out['normal_loss']
 
-                mp_lmk_mouth = torch.tensor(mp_lmk_mouth, device=image.device).float().view(1, -1, 2)
-                mp_lmk_nose = torch.tensor(mp_lmk_nose, device=image.device).float().view(1, -1, 2)
-                mp_lmk_contour = torch.tensor(mp_lmk_contour, device=image.device).float().view(1, -1, 2)
+        #     if self.opt.lambda_lap > 0:
+        #         loss = loss + self.opt.lambda_lap * out['lap_loss']
 
-                smplx_lmk_eye_brow, smplx_lmk_nose, _, smplx_lmk_eye, smplx_lmk_mouth, smplx_lmk_lips, \
-                    smplx_lmk_contour = torch.split(out['smplx_landmarks'], [10, 4, 5, 12, 12, 8, 17], dim=1)
-
-                #             # landmarks loss
-                #             lips_chamfer, _ = chamfer_distance(mp_lmk_mouth, smplx_lmk_mouth)
-                #             nose_chamfer, _ = chamfer_distance(mp_lmk_nose, smplx_lmk_nose)
-                #             contour_chamfer, _ = chamfer_distance(mp_lmk_contour, smplx_lmk_contour)
-                #             lmk_loss = lips_chamfer + nose_chamfer + contour_chamfer
-                #             # print(lmk_loss.item(), loss.item())
-                #             loss += lmk_loss * 1e4
-                #
-                # visualize
-                # nml_np = draw_landmarks(out['normal'][0].detach().cpu().numpy() * 255,
-                #                         torch.cat([smplx_lmk_mouth, smplx_lmk_nose, smplx_lmk_contour], 1)[0],
-                #                         fill=(0, 0, 255))
-                # rgb_np = draw_landmarks(rgb_np_ori*255, torch.tensor(mp_lmk_all).float().view(-1, 2), fill=(255, 0, 0))
-                nml_np_ori = out['normal'][0].detach().cpu().numpy().copy() * 255
-                nml_np = draw_landmarks(nml_np_ori, smplx_lmk_eye[0], fill=(255, 255, 255))
-                nml_np = draw_landmarks(nml_np, smplx_lmk_nose[0], fill=(255, 255, 255))
-                nml_np = draw_landmarks(nml_np, torch.cat([smplx_lmk_mouth, smplx_lmk_lips], 1)[0],
-                                        fill=(255, 255, 255))
-                nml_np = draw_landmarks(nml_np, smplx_lmk_eye_brow[0], fill=(255, 255, 255))
-
-                # rgb_np = draw_landmarks(rgb_np_ori * 255, smplx_lmk_eye[0], fill=(255, 255, 255))
-                # rgb_np = draw_landmarks(rgb_np, smplx_lmk_nose[0], fill=(255, 255, 255))
-                # rgb_np = draw_landmarks(rgb_np, torch.cat([smplx_lmk_mouth, smplx_lmk_lips], 1)[0], fill=(255, 255, 255))
-                # rgb_np = draw_landmarks(rgb_np, smplx_lmk_eye_brow[0], fill=(255, 255, 255))
-                # rgb_np = draw_landmarks(rgb_np * 255, out['smplx_landmarks'][0], fill=(0, 0, 255))
-
-                # nml_np = out['normal'][0].detach().cpu().numpy() * 255
-                rgb_np = draw_mediapipe_landmarks(rgb_np_ori * 255, mediapipe_landmarks)
-                nml_np_ori = out['normal'][0].detach().cpu().numpy().copy() * 255
-                # rgb_np = draw_landmarks(rgb_np, torch.cat([mp_lmk_mouth, mp_lmk_nose, mp_lmk_contour], 1)[0])
-                pred = np.hstack(
-                    [rgb_np[:, 80:-80], nml_np[:, 80:-80], rgb_np_ori[:, 80:256] * 255, nml_np_ori[:, 256:-80]])[50:]
-                cv2.imwrite("im.png", pred[..., ::-1])
-                exit()
-
-
-        return pred, loss
+        return pred, loss, pseudo_loss, latents, shading
 
     def eval_step(self, data):
         H, W = data['H'].item(), data['W'].item()
@@ -409,7 +535,9 @@ class Trainer(object):
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
 
+            # 随机决定，使用面部数据或使用全身数据
             with torch.no_grad():
+                # 使用面部数据
                 if random.random() < self.opt.train_face_ratio:
                     train_loader.dataset.full_body = False
                     face_center, face_scale = self.model.get_mesh_center_scale("face")
@@ -417,6 +545,7 @@ class Trainer(object):
                     train_loader.dataset.face_scale = face_scale.item() * 10
 
                 else:
+                    # 使用全身数据
                     train_loader.dataset.full_body = True
                     # body_center, body_scale = self.model.get_mesh_center_scale("body")
                     # train_loader.dataset.body_center = body_center
@@ -489,53 +618,138 @@ class Trainer(object):
         self.log(f"==> Finished Test.")
 
     def train_one_epoch(self, loader):
-        self.log(
-            f"==> Start Training {self.workspace} Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
+        """
+        执行一个训练周期
+        
+        Args:
+            loader: 数据加载器，提供训练数据
+        """
+        self.log(f"==> Start Training {self.workspace} Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
+        # 用于分布式训练中，确保主程序报告所有的指标
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
 
         self.model.train()
 
-        # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
-        # ref: https://pytorch.org/docs/stable/data.html
+        # 分布式训练设置: 在每个epoch开始时设置采样器，确保数据shuffle
         if self.world_size > 1:
             loader.sampler.set_epoch(self.epoch)
 
+        # 设置进度条 (仅在主进程)
         if self.local_rank == 0:
             pbar = tqdm.tqdm(total=len(loader) * loader.batch_size,
-                             bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
-
+                            bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        
+        # 重置本地步数计数器
         self.local_step = 0
 
         for data in loader:
+            # 随机选择当前变分分布的粒子
+            self.model.set_idx()
 
+            # # 如果启用了CUDA光线追踪，定期更新密度网格
+            # if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
+            #     with torch.cuda.amp.autocast(enabled=self.fp16):
+            #         self.model.update_extra_state()
+                    
             self.local_step += 1
             self.global_step += 1
 
+            # 清空优化器梯度
             self.optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                pred_rgbs, loss = self.train_step(data, loader.dataset.full_body)
+            # 执行训练步骤
+            with torch.amp.autocast('cuda', enabled=self.fp16):
+                pred_rgbs, loss, pseudo_loss, latents, shading = self.train_step(data, loader.dataset.full_body)
 
+            # 保存训练过程的可视化结果
             if self.global_step % 20 == 0:
                 pred = cv2.cvtColor(pred_rgbs, cv2.COLOR_RGB2BGR)
                 save_path = os.path.join(self.workspace, 'train-vis', f'{self.name}/{self.global_step:04d}.png')
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 cv2.imwrite(save_path, pred)
 
+            # 反向传播
             self.scaler.scale(loss).backward()
+            # 执行训练后的步骤（如TV正则化）
+            # self.post_train_step()
+            # 更新模型参数
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # 更新学习率调度器
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
 
             loss_val = loss.item()
             total_loss += loss_val
 
+            # VDS特有：将生成的latents添加到buffer中
+            if hasattr(self, 'opt') and hasattr(self.opt, 'buffer_size') and self.opt.buffer_size != -1:
+                self.add_buffer(latents, data['poses'])
+
+            # VDS特有：训练q_unet模型
+            if hasattr(self, 'q_unet') and hasattr(self, 'opt') and hasattr(self.opt, 'K2'):
+                # 每K2步训练一次q_unet，且不使用SDS方法时
+                if self.global_step % self.opt.K2 == 0 and not (hasattr(self.opt, 'sds') and self.opt.sds):
+                    # 执行K次q_unet的训练
+                    for _ in range(self.opt.K):
+                        # 清空q_unet优化器梯度
+                        self.unet_optimizer.zero_grad()
+                        
+                        # 随机选择时间步长
+                        timesteps = torch.randint(0, 1000, (self.opt.unet_bs,), device=self.device).long()
+                        
+                        # 准备训练数据
+                        with torch.no_grad():
+                            # 如果buffer未满，使用当前batch的latents扩展
+                            if not hasattr(self, 'buffer_imgs') or self.buffer_imgs is None or self.buffer_imgs.shape[0] < self.opt.buffer_size:
+                                latents_clean = latents.expand(self.opt.unet_bs, latents.shape[1], latents.shape[2], latents.shape[3]).contiguous()
+                                if hasattr(self.opt, 'q_cond') and self.opt.q_cond:
+                                    # 准备姿态条件
+                                    pose = data['poses']
+                                    pose = pose.view(pose.shape[0], 16)
+                                    pose = pose.expand(self.opt.unet_bs, 16).contiguous()
+                                    # 一定概率使用无条件训练
+                                    if random.random() < self.opt.uncond_p:
+                                        pose = torch.zeros_like(pose)
+                            else:
+                                # 从buffer中采样latents和对应的pose
+                                latents_clean, pose = self.sample_buffer(self.opt.unet_bs)
+                                # 一定概率使用无条件训练
+                                if random.random() < self.opt.uncond_p:
+                                    pose = torch.zeros_like(pose)
+                        
+                        # 添加噪声到latents
+                        noise = torch.randn(latents_clean.shape, device=self.device)
+                        latents_noisy = self.guidance.scheduler.add_noise(latents_clean, noise, timesteps)
+                        
+                        # 使用q_unet生成预测
+                        if hasattr(self.opt, 'q_cond') and self.opt.q_cond:
+                            model_output = self.q_unet(latents_noisy, timesteps, c=pose, shading=shading).sample
+                        else:
+                            model_output = self.q_unet(latents_noisy, timesteps).sample
+                        
+                        # 计算q_unet的损失
+                        if hasattr(self.opt, 'v_pred') and self.opt.v_pred:
+                            # v-prediction模式
+                            loss_unet = F.mse_loss(model_output, self.guidance.scheduler.get_velocity(latents_clean, noise, timesteps))
+                        else:
+                            # ε-prediction模式
+                            loss_unet = F.mse_loss(model_output, noise)
+                        
+                        # 反向传播和优化
+                        loss_unet.backward()
+                        self.unet_optimizer.step()
+                        
+                        # 更新q_unet的学习率调度器
+                        if self.scheduler_update_every_step:
+                            self.unet_scheduler.step()
+
+            # 记录训练进度和指标（仅在主进程）
             if self.local_rank == 0:
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
@@ -549,12 +763,15 @@ class Trainer(object):
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss / self.local_step:.4f})")
                 pbar.update(loader.batch_size)
 
+        # 更新EMA模型
         if self.ema is not None:
             self.ema.update()
 
+        # 计算平均损失并记录
         average_loss = total_loss / self.local_step
         self.stats["loss"].append(average_loss)
 
+        # 关闭进度条和报告训练指标（仅在主进程）
         if self.local_rank == 0:
             pbar.close()
             if self.report_metric_at_train:
@@ -564,6 +781,7 @@ class Trainer(object):
                         metric.write(self.writer, self.epoch, prefix="train")
                     metric.clear()
 
+        # 更新学习率调度器（如果不是每步更新）
         if not self.scheduler_update_every_step:
             if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 self.lr_scheduler.step(average_loss)

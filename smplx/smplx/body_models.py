@@ -1085,20 +1085,29 @@ class SMPLX(SMPLH):
     def create_mean_pose(self, data_struct, flat_hand_mean=False):
         # Create the array for the mean pose. If flat_hand is false, then use
         # the mean that is given by the data, rather than the flat open hand
-        global_orient_mean = torch.zeros([3], dtype=self.dtype)
-        body_pose_mean = torch.zeros([self.NUM_BODY_JOINTS * 3],
-                                     dtype=self.dtype)
-        jaw_pose_mean = torch.zeros([3], dtype=self.dtype)
-        leye_pose_mean = torch.zeros([3], dtype=self.dtype)
-        reye_pose_mean = torch.zeros([3], dtype=self.dtype)
+        global_orient_mean = torch.zeros([3], dtype=self.dtype).cpu().numpy()
+        body_pose_mean = torch.zeros([self.NUM_BODY_JOINTS * 3], dtype=self.dtype).cpu().numpy()
+        jaw_pose_mean = torch.zeros([3], dtype=self.dtype).cpu().numpy()
+        leye_pose_mean = torch.zeros([3], dtype=self.dtype).cpu().numpy()
+        reye_pose_mean = torch.zeros([3], dtype=self.dtype).cpu().numpy()
 
+        # 处理 left_hand_mean 和 right_hand_mean，确保它们是 NumPy 数组
+        left_hand_mean = self.left_hand_mean
+        right_hand_mean = self.right_hand_mean
+        if isinstance(left_hand_mean, torch.Tensor):
+            left_hand_mean = left_hand_mean.cpu().numpy()
+        if isinstance(right_hand_mean, torch.Tensor):
+            right_hand_mean = right_hand_mean.cpu().numpy()
+
+        # 使用 np.concatenate 连接所有 NumPy 数组
         pose_mean = np.concatenate([global_orient_mean, body_pose_mean,
                                     jaw_pose_mean,
                                     leye_pose_mean, reye_pose_mean,
-                                    self.left_hand_mean, self.right_hand_mean],
-                                   axis=0)
+                                    left_hand_mean, right_hand_mean],
+                                axis=0)
 
         return pose_mean
+
 
     def extra_repr(self):
         msg = super(SMPLX, self).extra_repr()

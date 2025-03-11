@@ -27,4 +27,4 @@ training:
   iters: 15000
   train_face_ratio: 0.3
   use_dpt: false
-  workspace: celebrities
+  workspace: new_VDS

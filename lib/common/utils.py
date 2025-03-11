@@ -87,7 +87,7 @@ def torch_vis_2d(x, renormalize=False):
     plt.show()
 
 
-@torch.cuda.amp.autocast(enabled=False)
+@torch.amp.autocast('cuda', enabled=False)
 def get_rays(poses, intrinsics, H, W, N=-1, error_map=None):
     ''' get rays
     Args:

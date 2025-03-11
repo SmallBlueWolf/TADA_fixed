@@ -103,6 +103,8 @@ class DLMesh(nn.Module):
             self.faces_list, self.dense_lbs_weights, self.uniques, self.vt, self.ft = self.get_init_body()
 
             N = self.dense_lbs_weights.shape[0]
+            
+            self.n_particles = 1
 
         # background network
         if not self.opt.skip_bg:
@@ -152,6 +154,12 @@ class DLMesh(nn.Module):
                                                output_facial_transformation_matrixes=True,
                                                num_faces=1)
         self.detector = vision.FaceLandmarker.create_from_options(options)
+
+    def set_idx(self, idx=None):
+        if idx == None:
+            self.idx = random.randint(0, self.n_particles-1)
+        else:
+            self.idx = idx
 
     @torch.no_grad()
     def get_init_body(self, cache_path='./data/init_body/data.npz'):

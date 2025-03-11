@@ -7,10 +7,15 @@ from lib.provider import ViewDataset
 from lib.trainer import *
 from lib.dlmesh import DLMesh
 from lib.common.utils import load_config
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 
 torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     # parser.add_argument('--mesh', type=str, required=True, help="mesh template, must be obj format")
@@ -24,6 +29,14 @@ if __name__ == '__main__':
         'text', args.text,
         'negative', args.negative,
     ])
+    
+    cfg.training.merge_from_list([
+        # 'num_particles', 1,  # 默认单粒子，可扩展到多粒子
+        'buffer_size', 100,  # 缓冲区大小
+        'K', 5,  # q_unet 训练步数
+        'K2', 10,  # q_unet 训练频率
+    ])
+    
     # cfg.model.merge_from_list(['mesh', args.mesh])
     # cfg.training.merge_from_list(['workspace', args.workspace])
     cfg.freeze()
