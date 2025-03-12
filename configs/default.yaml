@@ -29,7 +29,7 @@ training:
   known_view_noise_scale: 0.002
   lambda_rgb: 1000
   lambda_mask: 500
-  lambda_normal: 1000
+  # lambda_normal: 1000
   lambda_depth: 10
   use_dpt: False
   # VDS
@@ -37,12 +37,22 @@ training:
   normal: False
   normal_iters: -1
   # num_particles: 1，在self.model的定义里修改
+  dmtet: True
+  lambda_normal: 0
+  lambda_lap: 0.5
+  lambda_entropy: 10
+  lambda_opacity: 0
+  lambda_orient: 1e-2
   buffer_size: 100
   K: 5
   K2: 10
   unet_bs: 1
   unet_lr: 0.0001
   uncond_p: 0.1
+  no_textureless: False
+  no_lambertian: False
+  p_normal: 0
+  p_textureless: 0
 data:
   h: 512
   w: 512

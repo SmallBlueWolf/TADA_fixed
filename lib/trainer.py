@@ -393,7 +393,7 @@ class Trainer(object):
             as_latent = False
 
         # 使用RGB损失或SDS损失
-        if do_rgbd_loss:  # 使用RGB损失（当有真实图像参考时）
+        if False:  # 使用RGB损失（当有真实图像参考时）
             gt_rgb = data['rgb']  # [B, 3, H, W]
             gt_normal = data['normal']  # [B, H, W, 3]
             gt_depth = data['depth']  # [B, H, W]
@@ -428,61 +428,14 @@ class Trainer(object):
             )
             print(f'[INFO] Finish calculating loss!')
             
-            # # 额外的法线引导损失
-            # if not self.dpt:  # 如果没有深度预测网络
-            #     # 添加法线的guidance损失
-            #     normal_loss, _, _ = self.guidance.train_step(
-            #         dir_text_z, 
-            #         normal, 
-            #         guidance_scale=self.opt.scale, 
-            #         q_unet=self.q_unet,
-            #         pose=data['pose'].view(data['pose'].shape[0], 16) if 'pose' in data else None,
-            #         shading=shading
-            #     )
-            #     loss += normal_loss.mean()
-            # else:  # 如果有深度预测网络
-            #     # 在训练早期或随机情况下使用法线引导
-            #     if p_iter < 0.3 or random.random() < 0.5:
-            #         normal_loss, _, _ = self.guidance.train_step(
-            #             dir_text_z, 
-            #             normal, 
-            #             guidance_scale=self.opt.scale, 
-            #             q_unet=self.q_unet,
-            #             pose=data['pose'].view(data['pose'].shape[0], 16) if 'pose' in data else None,
-            #             shading=shading
-            #         )
-            #         loss += normal_loss.mean()
-            #     elif self.dpt is not None:
-            #         # 使用深度估计网络生成法线并计算损失
-            #         dpt_normal = self.dpt(image)
-            #         dpt_normal = (1 - dpt_normal) * alpha + (1 - alpha)
-            #         lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
-            #         loss += lambda_normal * (1 - F.cosine_similarity(normal, dpt_normal).mean())
+        # 添加额外的正则化项
+        if self.opt.dmtet:
+            # DMTet特有的正则化
+            if self.opt.lambda_normal > 0:
+                loss = loss + self.opt.lambda_normal * out['normal_loss']
 
-        # # 添加额外的正则化项
-        # if not self.opt.dmtet:
-        #     # 不透明度正则化
-        #     if self.opt.lambda_opacity > 0:
-        #         loss_opacity = (out['weights_sum'] ** 2).mean()
-        #         loss = loss + self.opt.lambda_opacity * loss_opacity
-
-        #     # 熵正则化
-        #     if self.opt.lambda_entropy > 0:
-        #         alphas = out['weights'].clamp(1e-5, 1 - 1e-5)
-        #         loss_entropy = (- alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
-        #         loss = loss + self.opt.lambda_entropy * loss_entropy
-
-        #     # 方向正则化
-        #     if self.opt.lambda_orient > 0 and 'loss_orient' in out:
-        #         loss_orient = out['loss_orient']
-        #         loss = loss + self.opt.lambda_orient * loss_orient
-        # else:
-        #     # DMTet特有的正则化
-        #     if self.opt.lambda_normal > 0:
-        #         loss = loss + self.opt.lambda_normal * out['normal_loss']
-
-        #     if self.opt.lambda_lap > 0:
-        #         loss = loss + self.opt.lambda_lap * out['lap_loss']
+            if self.opt.lambda_lap > 0:
+                loss = loss + self.opt.lambda_lap * out['lap_loss']
 
         return pred, loss, pseudo_loss, latents, shading
 

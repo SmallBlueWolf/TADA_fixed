@@ -104,7 +104,7 @@ class DLMesh(nn.Module):
 
             N = self.dense_lbs_weights.shape[0]
             
-            self.n_particles = 1
+            self.n_particles = 2
 
         # background network
         if not self.opt.skip_bg:
@@ -383,9 +383,43 @@ class DLMesh(nn.Module):
             light_d = (rays_o[0] + torch.randn(3, device=rays_o.device, dtype=torch.float))
             light_d = safe_normalize(light_d)
 
-        # render
         pr_mesh, smplx_landmarks = self.get_mesh(is_train=is_train)
 
+        '''计算DMTet正则化的lap_loss和normal_loss'''
+        if is_train:
+            from torch_scatter import scatter_add
+            v = pr_mesh.v  # [N, 3]
+            f = pr_mesh.f  # [M, 3]
+
+            # 计算 lap_loss
+            edges = torch.cat([f[:, [0,1]], f[:, [1,2]], f[:, [2,0]]], dim=0)  # [3M, 2]
+            idx_i = edges[:, 0]
+            idx_j = edges[:, 1]
+            idx_i = idx_i.long()  # 确保 idx_i 是 torch.long 类型
+            neighbor_sum = scatter_add(v[idx_j], idx_i, dim=0, dim_size=v.shape[0])  # [N, 3]
+            degree = scatter_add(torch.ones_like(idx_j), idx_i, dim=0, dim_size=v.shape[0])  # [N]
+            avg_neighbor = neighbor_sum / degree[:, None]  # [N, 3]
+            lap = v - avg_neighbor  # [N, 3]
+            lap_loss = (lap ** 2).sum(-1).mean()  # 标量
+
+            # 计算 normal_loss
+            v0 = v[f[:, 0]]  # [M, 3]
+            v1 = v[f[:, 1]]  # [M, 3]
+            v2 = v[f[:, 2]]  # [M, 3]
+            face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)  # [M, 3]
+            face_normals = F.normalize(face_normals, dim=-1)  # [M, 3]
+            edges_sorted = torch.sort(edges, dim=1)[0]  # [3M, 2]
+            _, inverse_indices = torch.unique(edges_sorted, return_inverse=True, dim=0)  # [3M]
+            sort_idx = torch.argsort(inverse_indices)  # [3M]
+            M = f.shape[0]
+            face_pairs = torch.stack([sort_idx[0::2] % M, sort_idx[1::2] % M], dim=1)  # [E, 2]
+            n1 = face_normals[face_pairs[:, 0]]  # [E, 3]
+            n2 = face_normals[face_pairs[:, 1]]  # [E, 3]
+            normal_loss = ((n1 - n2) ** 2).sum(-1).mean()  # 标量
+        
+        '''计算结束'''
+
+        # render
         rgb, normal, alpha = self.renderer(pr_mesh, mvp, h, w, light_d, ambient_ratio, shading, self.opt.ssaa,
                                            mlp_texture=self.mlp_texture, is_train=is_train)
         rgb = rgb * alpha + (1 - alpha) * bg_color
@@ -397,9 +431,16 @@ class DLMesh(nn.Module):
         smplx_landmarks = smplx_landmarks[..., :2] / smplx_landmarks[..., 2:3]
         smplx_landmarks = smplx_landmarks * 0.5 + 0.5
 
-        return {
+        out = {
             "image": rgb,
             "alpha": alpha,
             "normal": normal,
             "smplx_landmarks": smplx_landmarks,
         }
+
+        # 添加 DMTet 损失到输出（仅在训练且启用 DMTet 时）
+        if is_train:
+            out['lap_loss'] = lap_loss
+            out['normal_loss'] = normal_loss
+
+        return out
