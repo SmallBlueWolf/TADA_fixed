@@ -365,69 +365,76 @@ class Trainer(object):
         # 计算当前训练进度
         p_iter = self.global_step / self.opt.iters
 
-        # 选择着色模式
-        # 随机决定使用哪种着色模式 - 主要是为了训练多个着色样式的能力
-        if self.global_step < self.opt.albedo_iters+1:
-            shading = 'albedo'
-        else: 
-            rand = random.random()
-            if rand > 0.8: 
-                shading = 'albedo'
-            elif rand > 0.4 and (not self.opt.no_textureless): 
-                shading = 'textureless'
-            else: 
-                if not self.opt.no_lambertian:
-                    shading = 'lambertian'
-                else:
-                    shading = 'albedo'
-                    
-        if self.opt.normal:
-            shading = 'normal'
-            if self.opt.p_textureless > random.random():
-                shading = 'textureless'
-                    
-        if self.global_step < self.opt.normal_iters+1:
-            as_latent = True
-            shading = 'normal'
-        else:
-            as_latent = False
-
-        # 使用RGB损失或SDS损失
-        if False:  # 使用RGB损失（当有真实图像参考时）
+        loss = 0
+        pseudo_loss = 0
+        if do_rgbd_loss:  # with image input
+            # gt_mask = data['mask']  # [B, H, W]
             gt_rgb = data['rgb']  # [B, 3, H, W]
             gt_normal = data['normal']  # [B, H, W, 3]
             gt_depth = data['depth']  # [B, H, W]
-            
-            # RGB损失
-            loss = self.opt.lambda_rgb * F.mse_loss(image, gt_rgb)
-            
-            # 法线损失
+            # rgb loss
+            loss = loss + self.opt.lambda_rgb * F.mse_loss(image, gt_rgb)
+            # normal loss
             if self.opt.lambda_normal > 0:
                 lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
                 loss = loss + lambda_normal * (1 - F.cosine_similarity(normal, gt_normal).mean())
-                
-            # 深度损失
+            # depth loss
             if self.opt.lambda_depth > 0:
                 lambda_depth = self.opt.lambda_depth * min(1, self.global_step / self.opt.iters)
                 loss = loss + lambda_depth * (1 - self.pearson(depth, gt_depth))
         else:
-            # 使用VDS/SDS损失 (根据是否提供q_unet决定)
-            # 将生成的图像送入guidance网络计算损失
-            
-            # VDS方法: 使用self.q_unet进行变分扩散得分估计
-            # 在 trainer.py 的 train_step 或类似方法中
+            # rgb sds
             pose = data['poses'].view(B, 16)
+            _loss, pseudo_loss, latents = self.guidance.train_step(
+                    text_embeddings=dir_text_z,  # 文本嵌入，通常由 guidance.get_text_embeds 生成
+                    pred_rgb=image_annel,  # 渲染图像或潜在表示
+                    guidance_scale=100,  # 引导尺度
+                    q_unet=self.q_unet,  # 分数估计网络
+                    pose=pose,  # 可选的姿势条件
+                    shading='albedo'  # 可选的着色条件
+                )
+            loss = loss + _loss
+            if not self.dpt:
+                # normal sds
+                # loss += self.guidance.train_step(dir_text_z, normal).mean()
+                _loss, pseudo_loss, _latents = self.guidance.train_step(
+                    text_embeddings=dir_text_z,  # 文本嵌入，通常由 guidance.get_text_embeds 生成
+                    pred_rgb=normal,  # 渲染图像或潜在表示
+                    guidance_scale=100,  # 引导尺度
+                    q_unet=self.q_unet,  # 分数估计网络
+                    pose=pose,  # 可选的姿势条件
+                    shading='albedo'  # 可选的着色条件
+                )
+                loss = loss + _loss
+                # latent mean sds
+                # loss += self.guidance.train_step(dir_text_z, torch.cat([normal, image.detach()])).mean() * 0.1
+            else:
+                if p_iter < 0.3 or random.random() < 0.5:
+                    # normal sds
+                    # loss += self.guidance.train_step(dir_text_z, normal).mean()
+                    _loss, pseudo_loss, _latents = self.guidance.train_step(
+                        text_embeddings=dir_text_z,  # 文本嵌入，通常由 guidance.get_text_embeds 生成
+                        pred_rgb=image_annel,  # 渲染图像或潜在表示
+                        guidance_scale=100,  # 引导尺度
+                        q_unet=self.q_unet,  # 分数估计网络
+                        pose=pose,  # 可选的姿势条件
+                        shading='albedo'  # 可选的着色条件
+                    )
+                    loss = loss + _loss
+                elif self.dpt is not None :
+                    # normal image loss
+                    dpt_normal = self.dpt(image)
+                    dpt_normal = (1 - dpt_normal) * alpha + (1 - alpha)
+                    lambda_normal = self.opt.lambda_normal * min(1, self.global_step / self.opt.iters)
+                    loss = loss + lambda_normal * (1 - F.cosine_similarity(normal, dpt_normal).mean())
+
+                    # pred = np.hstack([(normal[0]).permute(1, 2, 0).detach().cpu().numpy(),
+                    #                   dpt_normal[0].permute(1, 2, 0).detach().cpu().numpy()]) * 255
+                    # cv2.imwrite("im.png", pred)
+                    # exit()
             
-            loss, pseudo_loss, latents = self.guidance.train_step(
-                text_embeddings=dir_text_z,  # 文本嵌入，通常由 guidance.get_text_embeds 生成
-                pred_rgb=image_annel,  # 渲染图像或潜在表示
-                guidance_scale=100,  # 引导尺度
-                q_unet=self.q_unet,  # 分数估计网络
-                pose=pose,  # 可选的姿势条件
-                shading=shading if 'shading' in data else 'albedo'  # 可选的着色条件
-            )
-            print(f'[INFO] Finish calculating loss!')
-            
+        print(f'[INFO] Finish calculating loss!')
+        
         # 添加额外的正则化项
         if self.opt.dmtet:
             # DMTet特有的正则化
@@ -437,7 +444,7 @@ class Trainer(object):
             if self.opt.lambda_lap > 0:
                 loss = loss + self.opt.lambda_lap * out['lap_loss']
 
-        return pred, loss, pseudo_loss, latents, shading
+        return pred, loss, pseudo_loss, latents, 'albedo'
 
     def eval_step(self, data):
         H, W = data['H'].item(), data['W'].item()
